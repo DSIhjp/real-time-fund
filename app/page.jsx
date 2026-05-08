@@ -3167,6 +3167,13 @@ export default function HomePage() {
         const updated = dedupeByCode([...newFunds, ...funds]);
         setFunds(updated);
         storageHelper.setItem('funds', JSON.stringify(updated));
+
+        setCollapsedCodes(prev => {
+          const nextSet = new Set(prev);
+          newFunds.forEach(f => nextSet.add(f.code));
+          storageHelper.setItem('collapsedCodes', JSON.stringify(Array.from(nextSet)));
+          return nextSet;
+        });
       }
 
       setSelectedFunds([]);
@@ -3277,6 +3284,13 @@ export default function HomePage() {
         const next = dedupeByCode([...newFunds, ...funds]);
         setFunds(next);
         storageHelper.setItem('funds', JSON.stringify(next));
+
+        setCollapsedCodes(prev => {
+          const nextSet = new Set(prev);
+          newFunds.forEach(f => nextSet.add(f.code));
+          storageHelper.setItem('collapsedCodes', JSON.stringify(Array.from(nextSet)));
+          return nextSet;
+        });
       }
       setSearchTerm('');
       setSelectedFunds([]);
