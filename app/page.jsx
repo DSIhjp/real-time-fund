@@ -2658,6 +2658,64 @@ export default function HomePage() {
     });
   };
 
+  const majorIndices = {
+    'sh000300': '沪深300',
+    'sh000905': '中证500',
+    'sh000001': '上证指数',
+    'sz399001': '深证成指',
+    'sz399006': '创业板指',
+    'sh000016': '上证50',
+    'sh000852': '中证1000',
+    'sh000688': '科创50'
+  };
+
+  const fetchMajorIndicesData = () => {
+    return new Promise((resolve) => {
+      const indicesStr = Object.keys(majorIndices).join(',');
+      const url = `https://qt.gtimg.cn/q=${indicesStr}`;
+
+      const script = document.createElement('script');
+      script.src = url;
+      script.onload = () => {
+        const indicesData = {};
+        Object.entries(majorIndices).forEach(([code, name]) => {
+          const varName = `v_${code}`;
+          const data = window[varName];
+          if (data && typeof data === 'string') {
+            const parts = data.split('~');
+            if (parts.length > 5) {
+              indicesData[code] = {
+                name,
+                change: parseFloat(parts[5]) || 0,
+                price: parseFloat(parts[3]) || 0
+              };
+            }
+          }
+        });
+        if (document.body.contains(script)) document.body.removeChild(script);
+        resolve(indicesData);
+      };
+      script.onerror = () => {
+        if (document.body.contains(script)) document.body.removeChild(script);
+        resolve({});
+      };
+      document.body.appendChild(script);
+    });
+  };
+
+  let cachedIndicesData = null;
+  let indicesCacheTime = 0;
+  const INDICES_CACHE_DURATION = 30000;
+
+  const getIndicesData = async () => {
+    const now = Date.now();
+    if (!cachedIndicesData || (now - indicesCacheTime) > INDICES_CACHE_DURATION) {
+      cachedIndicesData = await fetchMajorIndicesData();
+      indicesCacheTime = now;
+    }
+    return cachedIndicesData;
+  };
+
   // 当估值接口无法获取数据时，使用腾讯接口获取基金基本信息和净值（回退方案）
   const fetchFundDataFallback = async (c) => {
     return new Promise(async (resolve, reject) => {
@@ -2919,16 +2977,95 @@ export default function HomePage() {
           }).catch(() => resolveH([]));
         });
 
-        Promise.all([tencentPromise, holdingsPromise]).then(([tData, holdings]) => {
+        Promise.all([tencentPromise, holdingsPromise]).then(async ([tData, holdings]) => {
           if (tData) {
-            // 如果腾讯数据的日期更新（或相同），优先使用腾讯的净值数据（通常更准且包含涨跌幅）
             if (tData.jzrq && (!gzData.jzrq || tData.jzrq >= gzData.jzrq)) {
               gzData.dwjz = tData.dwjz;
               gzData.jzrq = tData.jzrq;
-              gzData.zzl = tData.zzl; // 真实涨跌幅
+              gzData.zzl = tData.zzl;
             }
           }
-          resolve({ ...gzData, holdings });
+
+          const validHoldings = holdings.filter(h => h.weight && h.change !== null && h.change !== undefined);
+          const holdingCoverage = validHoldings.reduce((sum, h) => {
+            const w = parseFloat(h.weight) / 100;
+            return sum + w;
+          }, 0);
+
+          const indicesData = await getIndicesData();
+
+          const isLikelyIndexFund = gzData.name && (
+            /指数|ETF|ETF联接|沪深300|中证500|中证1000|创业板|科创板|上证50/i.test(gzData.name) ||
+            /跟踪|被动/i.test(gzData.name || '')
+          );
+
+          if (validHoldings.length >= 3 && holdingCoverage > 0.15) {
+            let holdingWeightedChange = 0;
+            validHoldings.forEach(h => {
+              const w = parseFloat(h.weight) / 100;
+              holdingWeightedChange += w * h.change;
+            });
+
+            const normalizedChange = holdingCoverage > 0 ? holdingWeightedChange / holdingCoverage : 0;
+            const officialChange = typeof gzData.gszzl === 'number' ? gzData.gszzl : null;
+            const officialGsz = typeof gzData.gsz === 'number' ? gzData.gsz : null;
+
+            let bestEstimate = null;
+            let bestConfidence = 0;
+
+            if (officialChange !== null && officialGsz !== null && typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
+              const coverageFactor = Math.min(holdingCoverage * 2, 0.9);
+              const combinedChange = coverageFactor * normalizedChange + (1 - coverageFactor) * officialChange;
+              const estGsz = Number(gzData.dwjz) * (1 + combinedChange / 100);
+              bestEstimate = { change: combinedChange, gsz: estGsz };
+              bestConfidence = 0.8;
+            }
+
+            if (isLikelyIndexFund && indicesData['sh000300'] && indicesData['sh000300'].change !== 0) {
+              const hsz300Change = indicesData['sh000300'].change;
+              const hsz300Weight = Math.abs(normalizedChange - hsz300Change) < 0.5 ? 0.3 : 0;
+              if (hsz300Weight > 0 && bestEstimate) {
+                bestEstimate.change = bestEstimate.change * (1 - hsz300Weight) + hsz300Change * hsz300Weight;
+                bestEstimate.gsz = Number(gzData.dwjz) * (1 + bestEstimate.change / 100);
+                bestConfidence = Math.max(bestConfidence, 0.85);
+              }
+            }
+
+            if (bestEstimate && typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
+              gzData.estGsz = bestEstimate.gsz;
+              gzData.estGszzl = bestEstimate.change;
+              gzData.estPricedCoverage = holdingCoverage;
+              gzData.holdingEstimated = true;
+              gzData.enhancedConfidence = bestConfidence >= 0.85 ? 'high' : (bestConfidence >= 0.6 ? 'medium' : 'low');
+            } else if (normalizedChange !== 0 && typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
+              const estGsz = Number(gzData.dwjz) * (1 + normalizedChange / 100);
+              gzData.estGsz = estGsz;
+              gzData.estGszzl = normalizedChange;
+              gzData.estPricedCoverage = holdingCoverage;
+              gzData.holdingEstimated = true;
+              gzData.enhancedConfidence = holdingCoverage >= 0.5 ? 'high' : (holdingCoverage >= 0.3 ? 'medium' : 'low');
+            }
+          } else if (isLikelyIndexFund && !gzData.estGsz && typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
+            let bestIndexChange = null;
+            if (indicesData['sh000300'] && indicesData['sh000300'].change !== 0) {
+              bestIndexChange = indicesData['sh000300'].change;
+              gzData.relatedIndex = '沪深300';
+            } else if (indicesData['sz399006'] && indicesData['sz399006'].change !== 0) {
+              bestIndexChange = indicesData['sz399006'].change;
+              gzData.relatedIndex = '创业板指';
+            }
+
+            if (bestIndexChange !== null) {
+              gzData.estGszzl = bestIndexChange;
+              gzData.estGsz = Number(gzData.dwjz) * (1 + bestIndexChange / 100);
+              gzData.estPricedCoverage = 0;
+              gzData.holdingEstimated = true;
+              gzData.enhancedConfidence = 'low';
+            }
+          }
+
+          gzData.holdings = holdings;
+          resolve(gzData);
         });
       };
 
@@ -4550,8 +4687,12 @@ export default function HomePage() {
                                 </div>
 
                                 {f.estPricedCoverage > 0.05 && (
-                                  <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: -8, marginBottom: 10, textAlign: 'right' }}>
-                                    基于 {Math.round(f.estPricedCoverage * 100)}% 持仓估算
+                                  <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: -8, marginBottom: 10, textAlign: 'right', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6 }}>
+                                    <span style={{ opacity: 0.7 }}>
+                                      持仓估算 {Math.round(f.estPricedCoverage * 100)}%
+                                      {f.enhancedConfidence === 'high' && ' ⚡'}
+                                      {f.enhancedConfidence === 'medium' && ' ○'}
+                                    </span>
                                   </div>
                                 )}
                                 <div
