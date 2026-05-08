@@ -4206,15 +4206,87 @@ export default function HomePage() {
           </div>
 
           {displayFunds.length === 0 ? (
-            <div className="glass card empty" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px' }}>
-              <div style={{ fontSize: '48px', marginBottom: 16, opacity: 0.5 }}>📂</div>
-              <div className="muted" style={{ marginBottom: 20 }}>{funds.length === 0 ? '尚未添加基金' : '该分组下暂无数据'}</div>
-              {currentTab !== 'all' && currentTab !== 'fav' && funds.length > 0 && (
-                <button className="button" onClick={() => setAddFundToGroupOpen(true)}>
-                  添加基金到此分组
-                </button>
-              )}
-            </div>
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="glass card empty"
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '80px 40px',
+                textAlign: 'center'
+              }}
+            >
+              <div style={{
+                width: 80,
+                height: 80,
+                borderRadius: '50%',
+                background: 'linear-gradient(135deg, rgba(34, 211, 238, 0.1), rgba(59, 130, 246, 0.1))',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                marginBottom: 24,
+                fontSize: 36
+              }}>
+                📊
+              </div>
+              <h3 style={{
+                fontSize: 20,
+                fontWeight: 600,
+                marginBottom: 12,
+                color: 'var(--text-primary)'
+              }}>
+                {funds.length === 0 ? '开始追踪您的基金' : '该分组暂无数据'}
+              </h3>
+              <p className="muted" style={{
+                fontSize: 14,
+                marginBottom: 24,
+                maxWidth: 280,
+                lineHeight: 1.6
+              }}>
+                {funds.length === 0
+                  ? '在上方输入框输入基金代码，例如 110022 或 000001，开始实时追踪基金估值'
+                  : '从全部基金中添加基金到此分组'}
+              </p>
+              <div style={{
+                display: 'flex',
+                gap: 12,
+                flexWrap: 'wrap',
+                justifyContent: 'center'
+              }}>
+                {funds.length === 0 && (
+                  <div style={{
+                    display: 'flex',
+                    gap: 8,
+                    flexWrap: 'wrap',
+                    justifyContent: 'center'
+                  }}>
+                    {['110022', '000961', '161725'].map(code => (
+                      <button
+                        key={code}
+                        className="chip"
+                        onClick={() => {
+                          setSearchTerm(code);
+                          setTimeout(() => {
+                            document.querySelector('.input')?.focus();
+                          }, 100);
+                        }}
+                        style={{ fontFamily: 'var(--font-mono)' }}
+                      >
+                        {code}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {currentTab !== 'all' && currentTab !== 'fav' && funds.length > 0 && (
+                  <button className="button" onClick={() => setAddFundToGroupOpen(true)}>
+                    添加到此分组
+                  </button>
+                )}
+              </div>
+            </motion.div>
           ) : (
             <>
               <GroupSummary
@@ -4223,6 +4295,45 @@ export default function HomePage() {
                 groupName={getGroupName()}
                 getProfit={getHoldingProfit}
               />
+
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'flex-end',
+                gap: 8,
+                marginBottom: 12
+              }}>
+                <button
+                  className="chip"
+                  onClick={() => {
+                    const allCodes = displayFunds.map(f => f.code);
+                    setCollapsedCodes(prev => {
+                      const nextSet = new Set(prev);
+                      allCodes.forEach(c => nextSet.add(c));
+                      storageHelper.setItem('collapsedCodes', JSON.stringify(Array.from(nextSet)));
+                      return nextSet;
+                    });
+                  }}
+                  style={{ fontSize: 13 }}
+                >
+                  全部折叠
+                </button>
+                <button
+                  className="chip"
+                  onClick={() => {
+                    const allCodes = displayFunds.map(f => f.code);
+                    setCollapsedCodes(prev => {
+                      const nextSet = new Set(prev);
+                      allCodes.forEach(c => nextSet.delete(c));
+                      storageHelper.setItem('collapsedCodes', JSON.stringify(Array.from(nextSet)));
+                      return nextSet;
+                    });
+                  }}
+                  style={{ fontSize: 13 }}
+                >
+                  全部展开
+                </button>
+              </div>
 
               {currentTab !== 'all' && currentTab !== 'fav' && (
                 <motion.button
