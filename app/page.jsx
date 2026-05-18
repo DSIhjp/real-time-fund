@@ -1778,6 +1778,9 @@ export default function HomePage() {
   // 全局刷新状态
   const [refreshing, setRefreshing] = useState(false);
 
+  // 初始加载状态
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+
   // 收起/展开状态
   const [collapsedCodes, setCollapsedCodes] = useState(new Set());
 
@@ -1827,6 +1830,7 @@ export default function HomePage() {
   const searchTimeoutRef = useRef(null);
   const dropdownRef = useRef(null);
   const [showDropdown, setShowDropdown] = useState(false);
+  const [focusedSearchIndex, setFocusedSearchIndex] = useState(-1);
   const [addResultOpen, setAddResultOpen] = useState(false);
   const [addFailures, setAddFailures] = useState([]);
   const [holdingModal, setHoldingModal] = useState({ open: false, fund: null });
@@ -2030,6 +2034,14 @@ export default function HomePage() {
     };
   };
 
+  const profitCache = useMemo(() => {
+    const cache = {};
+    funds.forEach(f => {
+      cache[f.code] = getHoldingProfit(f, holdings[f.code]);
+    });
+    return cache;
+  }, [funds, holdings, isTradingDay, todayStr]);
+
 
   // 过滤和排序后的基金列表
   const displayFunds = funds
@@ -2046,8 +2058,8 @@ export default function HomePage() {
         return sortOrder === 'asc' ? valA - valB : valB - valA;
       }
       if (sortBy === 'holding') {
-        const pa = getHoldingProfit(a, holdings[a.code]);
-        const pb = getHoldingProfit(b, holdings[b.code]);
+        const pa = profitCache[a.code];
+        const pb = profitCache[b.code];
         const valA = pa?.profitTotal ?? Number.NEGATIVE_INFINITY;
         const valB = pb?.profitTotal ?? Number.NEGATIVE_INFINITY;
         return sortOrder === 'asc' ? valA - valB : valB - valA;
@@ -2182,9 +2194,17 @@ export default function HomePage() {
   const showToast = (message, type = 'info') => {
     if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
     setToast({ show: true, message, type });
-    toastTimeoutRef.current = setTimeout(() => {
-      setToast((prev) => ({ ...prev, show: false }));
-    }, 3000);
+    const isAutoClose = type !== 'error';
+    if (isAutoClose) {
+      toastTimeoutRef.current = setTimeout(() => {
+        setToast((prev) => ({ ...prev, show: false }));
+      }, 3000);
+    }
+  };
+
+  const hideToast = () => {
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    setToast((prev) => ({ ...prev, show: false }));
   };
 
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
@@ -2411,7 +2431,10 @@ export default function HomePage() {
       if (savedHoldings && typeof savedHoldings === 'object') {
         setHoldings(savedHoldings);
       }
-    } catch { }
+    } catch (e) {
+      console.warn('[初始化] 加载本地数据失败:', e?.message || e);
+    }
+    setIsInitialLoading(false);
   }, []);
 
   // 初始化认证状态监听
@@ -2441,7 +2464,7 @@ export default function HomePage() {
               storageHelper.removeItem(key);
             }
           });
-        } catch { }
+        } catch (e) { console.warn('[登出] 清理 localStorage 失败:', e?.message); }
         try {
           const sessionKeys = Object.keys(sessionStorage);
           sessionKeys.forEach((key) => {
@@ -2449,7 +2472,7 @@ export default function HomePage() {
               sessionStorage.removeItem(key);
             }
           });
-        } catch { }
+        } catch (e) { console.warn('[登出] 清理 sessionStorage 失败:', e?.message); }
         clearAuthState();
         setLoginError('会话已过期，请重新登录');
         showToast('会话已过期，请重新登录', 'error');
@@ -2588,7 +2611,7 @@ export default function HomePage() {
     } finally {
       try {
         await supabase.auth.signOut({ scope: 'local' });
-      } catch { }
+      } catch (e) { console.warn('[登出] signOut 失败:', e?.message); }
       try {
         const storageKeys = Object.keys(localStorage);
         storageKeys.forEach((key) => {
@@ -2596,7 +2619,7 @@ export default function HomePage() {
             storageHelper.removeItem(key);
           }
         });
-      } catch { }
+      } catch (e) { console.warn('[登出] 清理 localStorage 失败:', e?.message); }
       try {
         const sessionKeys = Object.keys(sessionStorage);
         sessionKeys.forEach((key) => {
@@ -2604,7 +2627,7 @@ export default function HomePage() {
             sessionStorage.removeItem(key);
           }
         });
-      } catch { }
+      } catch (e) { console.warn('[登出] 清理 sessionStorage 失败:', e?.message); }
       setLoginModalOpen(false);
       setLoginError('');
       setLoginSuccess('');
@@ -2647,13 +2670,67 @@ export default function HomePage() {
       script.src = url;
       script.async = true;
       script.onload = () => {
-        document.body.removeChild(script);
+        if (document.body.contains(script)) document.body.removeChild(script);
         resolve();
       };
       script.onerror = () => {
-        document.body.removeChild(script);
+        if (document.body.contains(script)) document.body.removeChild(script);
         reject(new Error('数据加载失败'));
       };
+      document.body.appendChild(script);
+    });
+  };
+
+  let jsonpIdCounter = 0;
+
+  const jsonpRequest = (url, callbackName) => {
+    return new Promise((resolve, reject) => {
+      const uid = ++jsonpIdCounter;
+      const uniqueCbName = `_jsonp_${callbackName}_${uid}_${Date.now()}`;
+      const timeoutMs = 8000;
+      let settled = false;
+
+      const cleanup = () => {
+        if (window[uniqueCbName]) {
+          try { delete window[uniqueCbName]; } catch { window[uniqueCbName] = undefined; }
+        }
+      };
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error(`JSONP 超时: ${callbackName}`));
+      }, timeoutMs);
+
+      window[uniqueCbName] = (data) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        resolve(data);
+      };
+
+      const script = document.createElement('script');
+      script.src = url.includes('callback=')
+        ? url
+        : `${url}${url.includes('?') ? '&' : '?'}callback=${uniqueCbName}`;
+
+      script.async = true;
+      script.onerror = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        if (document.body.contains(script)) document.body.removeChild(script);
+        reject(new Error(`JSONP 加载失败: ${callbackName}`));
+      };
+      script.onload = () => {
+        setTimeout(() => {
+          if (document.body.contains(script)) document.body.removeChild(script);
+        }, 100);
+      };
+
       document.body.appendChild(script);
     });
   };
@@ -2809,6 +2886,8 @@ export default function HomePage() {
 
   const fetchFundData = async (c) => {
     return new Promise(async (resolve, reject) => {
+      let gzDataResolved = false;
+
       // 腾讯接口识别逻辑优化
       const getTencentPrefix = (code) => {
         if (code.startsWith('6') || code.startsWith('9')) return 'sh';
@@ -2829,6 +2908,8 @@ export default function HomePage() {
 
       const originalJsonpgz = window.jsonpgz;
       window.jsonpgz = (json) => {
+        if (gzDataResolved) return;
+        gzDataResolved = true;
         window.jsonpgz = originalJsonpgz; // 立即恢复
         if (!json || typeof json !== 'object') {
           // 估值数据无法获取时，尝试使用腾讯接口获取基金基本信息和净值
@@ -3076,10 +3157,15 @@ export default function HomePage() {
       };
 
       document.body.appendChild(scriptGz);
-      // 加载完立即移除脚本
-      setTimeout(() => {
+
+      const gzTimeout = setTimeout(() => {
+        window.jsonpgz = originalJsonpgz;
         if (document.body.contains(scriptGz)) document.body.removeChild(scriptGz);
-      }, 5000);
+        if (!gzDataResolved) {
+          gzDataResolved = true;
+          fetchFundDataFallback(c).then(resolve).catch(reject);
+        }
+      }, 8000);
     });
   };
 
@@ -3437,7 +3523,8 @@ export default function HomePage() {
         holdings: cleanedHoldings,
         exportedAt: new Date().toISOString()
       };
-    } catch {
+    } catch (e) {
+      console.warn('[导出] 收集本地数据失败:', e?.message);
       return {
         funds: [],
         favorites: [],
@@ -3993,7 +4080,35 @@ export default function HomePage() {
                   placeholder="搜索基金名称或代码..."
                   value={searchTerm}
                   onChange={handleSearchInput}
-                  onFocus={() => setShowDropdown(true)}
+                  onFocus={() => {
+                    setShowDropdown(true);
+                    setFocusedSearchIndex(-1);
+                  }}
+                  onKeyDown={(e) => {
+                    if (!showDropdown || searchResults.length === 0) return;
+                    if (e.key === 'ArrowDown') {
+                      e.preventDefault();
+                      setFocusedSearchIndex(prev =>
+                        prev < searchResults.length - 1 ? prev + 1 : 0
+                      );
+                    } else if (e.key === 'ArrowUp') {
+                      e.preventDefault();
+                      setFocusedSearchIndex(prev =>
+                        prev > 0 ? prev - 1 : searchResults.length - 1
+                      );
+                    } else if (e.key === 'Enter') {
+                      e.preventDefault();
+                      if (focusedSearchIndex >= 0 && focusedSearchIndex < searchResults.length) {
+                        const fund = searchResults[focusedSearchIndex];
+                        const isAlreadyAdded = funds.some(f => f.code === fund.CODE);
+                        if (!isAlreadyAdded) toggleSelectFund(fund);
+                      }
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      setShowDropdown(false);
+                      setFocusedSearchIndex(-1);
+                    }
+                  }}
                 />
                 {isSearching && <div className="search-spinner" />}
               </div>
@@ -4017,17 +4132,19 @@ export default function HomePage() {
                 >
                   {searchResults.length > 0 ? (
                     <div className="search-results">
-                      {searchResults.map((fund) => {
+                      {searchResults.map((fund, idx) => {
                         const isSelected = selectedFunds.some(f => f.CODE === fund.CODE);
                         const isAlreadyAdded = funds.some(f => f.code === fund.CODE);
+                        const isFocused = idx === focusedSearchIndex;
                         return (
                           <div
                             key={fund.CODE}
-                            className={`search-item ${isSelected ? 'selected' : ''} ${isAlreadyAdded ? 'added' : ''}`}
+                            className={`search-item ${isSelected ? 'selected' : ''} ${isAlreadyAdded ? 'added' : ''} ${isFocused ? 'focused' : ''}`}
                             onClick={() => {
                               if (isAlreadyAdded) return;
                               toggleSelectFund(fund);
                             }}
+                            onMouseEnter={() => setFocusedSearchIndex(idx)}
                           >
                             <div className="fund-info">
                               <span className="fund-name">{fund.NAME}</span>
@@ -4205,7 +4322,57 @@ export default function HomePage() {
             </div>
           </div>
 
-          {displayFunds.length === 0 ? (
+          {isInitialLoading ? (
+            <div className="glass card" style={{ padding: '32px 24px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {[1, 2, 3].map(i => (
+                  <div key={i} style={{
+                    display: 'flex',
+                    gap: 16,
+                    alignItems: 'center',
+                    padding: '20px',
+                    background: 'var(--bg-secondary)',
+                    borderRadius: 'var(--radius-md)'
+                  }}>
+                    <div style={{
+                      width: 48,
+                      height: 48,
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'linear-gradient(90deg, var(--border-subtle) 25%, var(--border-default) 50%, var(--border-subtle) 75%)',
+                      backgroundSize: '200% 100%',
+                      animation: 'shimmer 1.5s infinite'
+                    }} />
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      <div style={{
+                        width: '60%',
+                        height: 16,
+                        borderRadius: 4,
+                        background: 'linear-gradient(90deg, var(--border-subtle) 25%, var(--border-default) 50%, var(--border-subtle) 75%)',
+                        backgroundSize: '200% 100%',
+                        animation: 'shimmer 1.5s infinite'
+                      }} />
+                      <div style={{
+                        width: '40%',
+                        height: 12,
+                        borderRadius: 4,
+                        background: 'linear-gradient(90deg, var(--border-subtle) 25%, var(--border-default) 50%, var(--border-subtle) 75%)',
+                        backgroundSize: '200% 100%',
+                        animation: 'shimmer 1.5s infinite'
+                      }} />
+                    </div>
+                    <div style={{
+                      width: 80,
+                      height: 36,
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'linear-gradient(90deg, var(--border-subtle) 25%, var(--border-default) 50%, var(--border-subtle) 75%)',
+                      backgroundSize: '200% 100%',
+                      animation: 'shimmer 1.5s infinite'
+                    }} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : displayFunds.length === 0 ? (
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
@@ -4560,8 +4727,7 @@ export default function HomePage() {
                                   <span className="muted" style={{ fontSize: '12px' }}>{f.noValuation ? (f.jzrq || '-') : (f.gztime || f.time || '-')}</span>
                                 </div>
                                 {!isMobile && (() => {
-                                  const holding = holdings[f.code];
-                                  const profit = getHoldingProfit(f, holding);
+                                  const profit = profitCache[f.code];
                                   const amount = profit ? profit.amount : null;
                                   if (amount === null) {
                                     return (
@@ -4595,8 +4761,7 @@ export default function HomePage() {
                                   );
                                 })()}
                                 {(() => {
-                                  const holding = holdings[f.code];
-                                  const profit = getHoldingProfit(f, holding);
+                                  const profit = profitCache[f.code];
                                   const profitValue = profit ? profit.profitToday : null;
                                   const hasProfit = profitValue !== null;
 
@@ -4614,9 +4779,9 @@ export default function HomePage() {
                                   );
                                 })()}
                                 {!isMobile && (() => {
-                                  const holding = holdings[f.code];
-                                  const profit = getHoldingProfit(f, holding);
+                                  const profit = profitCache[f.code];
                                   const total = profit ? profit.profitTotal : null;
+                                  const holding = holdings[f.code];
                                   const principal = holding && holding.cost && holding.share ? holding.cost * holding.share : 0;
                                   const asPercent = percentModes[f.code];
                                   const hasTotal = total !== null;
@@ -4750,8 +4915,8 @@ export default function HomePage() {
 
                                 <div className="row" style={{ marginBottom: 12 }}>
                                   {(() => {
+                                    const profit = profitCache[f.code];
                                     const holding = holdings[f.code];
-                                    const profit = getHoldingProfit(f, holding);
 
                                     if (!profit) {
                                       return (
@@ -5395,7 +5560,29 @@ export default function HomePage() {
                 <path d="M20 6L9 17l-5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
               </svg>
             )}
-            {toast.message}
+            <span style={{ flex: 1 }}>{toast.message}</span>
+            {toast.type === 'error' && (
+              <button
+                onClick={hideToast}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: '#fff',
+                  cursor: 'pointer',
+                  padding: '2px 4px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  opacity: 0.8,
+                  transition: 'opacity 0.2s'
+                }}
+                onMouseEnter={(e) => e.currentTarget.style.opacity = '1'}
+                onMouseLeave={(e) => e.currentTarget.style.opacity = '0.8'}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+                </svg>
+              </button>
+            )}
           </motion.div>
         )}
       </AnimatePresence>

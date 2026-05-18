@@ -613,6 +613,11 @@ input[type="number"] {
   border-color: rgba(34, 211, 238, 0.3);
 }
 
+.search-item.focused:not(.selected):not(.added) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-default);
+}
+
 .search-item.added {
   cursor: not-allowed;
   opacity: 0.5;
