@@ -2011,8 +2011,17 @@ export default function HomePage() {
 
       if (canCalcTodayProfit) {
         const amount = holding.share * currentNav;
-        // 估值涨跌幅
-        const gzChange = fund.estPricedCoverage > 0.05 ? fund.estGszzl : (Number(fund.gszzl) || 0);
+        let gzChange = fund.estPricedCoverage > 0.05 ? fund.estGszzl : (Number(fund.gszzl) || 0);
+
+        if (fund.fundType === 'bond' && !fund.holdingEstimated && typeof fund.gszzl === 'number') {
+          gzChange = fund.gszzl * 0.6;
+        }
+
+        if (fund.sinaReference && typeof fund.sinaReference === 'number' && fund.estPricedCoverage < 0.3) {
+          const blendWeight = Math.min(0.3, (0.3 - fund.estPricedCoverage) * 1.5);
+          gzChange = gzChange * (1 - blendWeight) + fund.sinaReference * blendWeight;
+        }
+
         profitToday = amount - (amount / (1 + gzChange / 100));
       } else {
         profitToday = null;
@@ -2793,6 +2802,20 @@ export default function HomePage() {
     return cachedIndicesData;
   };
 
+  let holdingsCache = {};
+  const HOLDINGS_CACHE_DURATION = 120000;
+
+  const getCachedHoldings = async (code, fetchFn) => {
+    const now = Date.now();
+    const cached = holdingsCache[code];
+    if (cached && (now - cached.time) < HOLDINGS_CACHE_DURATION) {
+      return cached.data;
+    }
+    const data = await fetchFn();
+    holdingsCache[code] = { data, time: now };
+    return data;
+  };
+
   // 当估值接口无法获取数据时，使用腾讯接口获取基金基本信息和净值（回退方案）
   const fetchFundDataFallback = async (c) => {
     return new Promise(async (resolve, reject) => {
@@ -2954,7 +2977,7 @@ export default function HomePage() {
           document.body.appendChild(tScript);
         });
 
-        const holdingsPromise = new Promise((resolveH) => {
+        const rawHoldingsFetcher = () => new Promise((resolveH) => {
           const holdingsUrl = `https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code=${c}&topline=10&year=&month=&_=${Date.now()}`;
           loadScript(holdingsUrl).then(async () => {
             let holdings = [];
@@ -3058,6 +3081,8 @@ export default function HomePage() {
           }).catch(() => resolveH([]));
         });
 
+        const holdingsPromise = getCachedHoldings(c, rawHoldingsFetcher);
+
         Promise.all([tencentPromise, holdingsPromise]).then(async ([tData, holdings]) => {
           if (tData) {
             if (tData.jzrq && (!gzData.jzrq || tData.jzrq >= gzData.jzrq)) {
@@ -3080,36 +3105,117 @@ export default function HomePage() {
             /跟踪|被动/i.test(gzData.name || '')
           );
 
+          const isLikelyBondFund = gzData.name && (
+            /债券|纯债|一级债|二级债|可转债|信用债|利率债|国债|金融债|企业债/i.test(gzData.name) ||
+            /^\d{6}$/.test(c) && c.startsWith('00') && !/股票|混合|指数/i.test(gzData.name)
+          );
+
+          const isLikelyMoneyFund = gzData.name && (
+            /货币|现金管理|活期|余额/i.test(gzData.name) ||
+            /^\d{6}$/.test(c) && c.startsWith('004') || c.startsWith('003')
+          );
+
+          const isLikelyMixedFund = gzData.name && (
+            /混合|配置|灵活|稳健|平衡|增值/i.test(gzData.name) &&
+            !/债券|纯债|货币/i.test(gzData.name)
+          );
+
+          const isLikelyStockFund = gzData.name && (
+            /股票|成长|价值|优选|精选|行业|主题|积极/i.test(gzData.name) ||
+            (!isLikelyBondFund && !isLikelyMoneyFund && !isLikelyIndexFund && !isLikelyMixedFund)
+          );
+
+          gzData.fundType = isLikelyBondFund ? 'bond' : (isLikelyMoneyFund ? 'money' : (isLikelyIndexFund ? 'index' : (isLikelyMixedFund ? 'mixed' : 'stock')));
+
           if (validHoldings.length >= 3 && holdingCoverage > 0.15) {
             let holdingWeightedChange = 0;
+            let stockWeightedVolatility = 0;
             validHoldings.forEach(h => {
               const w = parseFloat(h.weight) / 100;
               holdingWeightedChange += w * h.change;
+              stockWeightedVolatility += w * Math.abs(h.change);
             });
 
             const normalizedChange = holdingCoverage > 0 ? holdingWeightedChange / holdingCoverage : 0;
+            const avgStockVolatility = holdingCoverage > 0 ? stockWeightedVolatility / holdingCoverage : Math.abs(normalizedChange);
+
             const officialChange = typeof gzData.gszzl === 'number' ? gzData.gszzl : null;
             const officialGsz = typeof gzData.gsz === 'number' ? gzData.gsz : null;
 
             let bestEstimate = null;
             let bestConfidence = 0;
 
+            const nonEquityRatio = Math.max(0, Math.min(1 - holdingCoverage - 0.05, 0.7));
+            const bondPortionImpact = isLikelyBondFund ? nonEquityRatio * 0.05 : nonEquityRatio * 0.02;
+            const cashPortionImpact = nonEquityRatio * 0.01;
+            const nonEquityAdjustment = -(bondPortionImpact + cashPortionImpact);
+
             if (officialChange !== null && officialGsz !== null && typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
-              const coverageFactor = Math.min(holdingCoverage * 2, 0.9);
-              const combinedChange = coverageFactor * normalizedChange + (1 - coverageFactor) * officialChange;
+              const rawCoverageFactor = Math.tanh(holdingCoverage * 2.5);
+              const volatilityPenalty = avgStockVolatility > 2 ? Math.max(0, (avgStockVolatility - 2) / 10) : 0;
+              const coverageFactor = Math.max(0.25, Math.min(0.92, rawCoverageFactor - volatilityPenalty));
+
+              const adjustedHoldingChange = normalizedChange + nonEquityAdjustment;
+              const combinedChange = coverageFactor * adjustedHoldingChange + (1 - coverageFactor) * officialChange;
               const estGsz = Number(gzData.dwjz) * (1 + combinedChange / 100);
               bestEstimate = { change: combinedChange, gsz: estGsz };
-              bestConfidence = 0.8;
-            }
+              bestConfidence = 0.7 + coverageFactor * 0.2;
 
-            if (isLikelyIndexFund && indicesData['sh000300'] && indicesData['sh000300'].change !== 0) {
-              const hsz300Change = indicesData['sh000300'].change;
-              const hsz300Weight = Math.abs(normalizedChange - hsz300Change) < 0.5 ? 0.3 : 0;
-              if (hsz300Weight > 0 && bestEstimate) {
-                bestEstimate.change = bestEstimate.change * (1 - hsz300Weight) + hsz300Change * hsz300Weight;
-                bestEstimate.gsz = Number(gzData.dwjz) * (1 + bestEstimate.change / 100);
+              if (Math.abs(combinedChange - officialChange) < 0.3) {
                 bestConfidence = Math.max(bestConfidence, 0.85);
               }
+            }
+
+            if (isLikelyIndexFund && indicesData) {
+              const indexMatchMap = [
+                { pattern: /沪深300|300ETF/, key: 'sh000300', name: '沪深300' },
+                { pattern: /中证500|500ETF/, key: 'sh000905', name: '中证500' },
+                { pattern: /中证1000|1000ETF/, key: 'sh000852', name: '中证1000' },
+                { pattern: /上证50|50ETF/, key: 'sh000016', name: '上证50' },
+                { pattern: /创业板|创业ETF/, key: 'sz399006', name: '创业板指' },
+                { pattern: /科创50|科创ETF/, key: 'sh000688', name: '科创50' },
+                { pattern: /深证成指/, key: 'sz399001', name: '深证成指' },
+                { pattern: /上证指数/, key: 'sh000001', name: '上证指数' },
+              ];
+
+              let matchedIndex = null;
+              for (const idx of indexMatchMap) {
+                if (idx.pattern.test(gzData.name)) {
+                  matchedIndex = idx;
+                  break;
+                }
+              }
+
+              const targetIndexKey = matchedIndex?.key || 'sh000300';
+              const targetIndexName = matchedIndex?.name || '沪深300';
+
+              if (indicesData[targetIndexKey] && indicesData[targetIndexKey].change !== 0) {
+                const indexChange = indicesData[targetIndexKey].change;
+                const deviation = Math.abs(normalizedChange - indexChange);
+                const indexWeight = deviation < 1.5 ? (deviation < 0.5 ? 0.35 : 0.2) : (deviation < 3 ? 0.1 : 0);
+
+                if (indexWeight > 0 && bestEstimate) {
+                  const prevChange = bestEstimate.change;
+                  bestEstimate.change = prevChange * (1 - indexWeight) + indexChange * indexWeight;
+                  bestEstimate.gsz = Number(gzData.dwjz) * (1 + bestEstimate.change / 100);
+                  bestConfidence = Math.max(bestConfidence, 0.85);
+                  gzData.relatedIndex = targetIndexName;
+                  gzData.indexChange = indexChange;
+                } else if (!bestEstimate && indexChange !== null) {
+                  gzData.estGszzl = indexChange;
+                  gzData.estGsz = Number(gzData.dwjz) * (1 + indexChange / 100);
+                  gzData.estPricedCoverage = 0;
+                  gzData.holdingEstimated = true;
+                  gzData.enhancedConfidence = 'low';
+                  gzData.relatedIndex = targetIndexName;
+                }
+              }
+            }
+
+            if (isLikelyBondFund && bestEstimate) {
+              bestEstimate.change *= 0.6;
+              bestEstimate.gsz = Number(gzData.dwjz) * (1 + bestEstimate.change / 100);
+              bestConfidence = Math.max(bestConfidence, 0.75);
             }
 
             if (bestEstimate && typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
@@ -3117,23 +3223,49 @@ export default function HomePage() {
               gzData.estGszzl = bestEstimate.change;
               gzData.estPricedCoverage = holdingCoverage;
               gzData.holdingEstimated = true;
-              gzData.enhancedConfidence = bestConfidence >= 0.85 ? 'high' : (bestConfidence >= 0.6 ? 'medium' : 'low');
+              gzData.enhancedConfidence = bestConfidence >= 0.85 ? 'high' : (bestConfidence >= 0.65 ? 'medium' : 'low');
             } else if (normalizedChange !== 0 && typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
-              const estGsz = Number(gzData.dwjz) * (1 + normalizedChange / 100);
+              const adjustedChange = normalizedChange + nonEquityAdjustment;
+              const estGsz = Number(gzData.dwjz) * (1 + adjustedChange / 100);
               gzData.estGsz = estGsz;
-              gzData.estGszzl = normalizedChange;
+              gzData.estGszzl = adjustedChange;
               gzData.estPricedCoverage = holdingCoverage;
               gzData.holdingEstimated = true;
               gzData.enhancedConfidence = holdingCoverage >= 0.5 ? 'high' : (holdingCoverage >= 0.3 ? 'medium' : 'low');
             }
           } else if (isLikelyIndexFund && !gzData.estGsz && typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
+            const indexMatchMap = [
+              { pattern: /沪深300|300ETF/, key: 'sh000300', name: '沪深300' },
+              { pattern: /中证500|500ETF/, key: 'sh000905', name: '中证500' },
+              { pattern: /中证1000|1000ETF/, key: 'sh000852', name: '中证1000' },
+              { pattern: /上证50|50ETF/, key: 'sh000016', name: '上证50' },
+              { pattern: /创业板|创业ETF/, key: 'sz399006', name: '创业板指' },
+              { pattern: /科创50|科创ETF/, key: 'sh000688', name: '科创50' },
+              { pattern: /深证成指/, key: 'sz399001', name: '深证成指' },
+              { pattern: /上证指数/, key: 'sh000001', name: '上证指数' },
+            ];
+
             let bestIndexChange = null;
-            if (indicesData['sh000300'] && indicesData['sh000300'].change !== 0) {
-              bestIndexChange = indicesData['sh000300'].change;
-              gzData.relatedIndex = '沪深300';
-            } else if (indicesData['sz399006'] && indicesData['sz399006'].change !== 0) {
-              bestIndexChange = indicesData['sz399006'].change;
-              gzData.relatedIndex = '创业板指';
+            let matchedIndexName = null;
+
+            for (const idx of indexMatchMap) {
+              if (idx.pattern.test(gzData.name)) {
+                if (indicesData[idx.key] && indicesData[idx.key].change !== 0) {
+                  bestIndexChange = indicesData[idx.key].change;
+                  matchedIndexName = idx.name;
+                }
+                break;
+              }
+            }
+
+            if (!bestIndexChange) {
+              if (indicesData['sh000300'] && indicesData['sh000300'].change !== 0) {
+                bestIndexChange = indicesData['sh000300'].change;
+                matchedIndexName = '沪深300';
+              } else if (indicesData['sz399006'] && indicesData['sz399006'].change !== 0) {
+                bestIndexChange = indicesData['sz399006'].change;
+                matchedIndexName = '创业板指';
+              }
             }
 
             if (bestIndexChange !== null) {
@@ -3142,10 +3274,89 @@ export default function HomePage() {
               gzData.estPricedCoverage = 0;
               gzData.holdingEstimated = true;
               gzData.enhancedConfidence = 'low';
+              gzData.relatedIndex = matchedIndexName;
             }
+          } else if (isLikelyBondFund && !gzData.estGsz && typeof gzData.gszzl === 'number') {
+            const bondDampening = 0.5;
+            gzData.estGszzl = gzData.gszzl * bondDampening;
+            gzData.estGsz = typeof gzData.gsz === 'number' ? gzData.gsz :
+              (Number(gzData.dwjz) * (1 + gzData.estGszzl / 100));
+            gzData.estPricedCoverage = 0;
+            gzData.holdingEstimated = true;
+            gzData.enhancedConfidence = 'medium';
           }
 
           gzData.holdings = holdings;
+
+          const sinaValidationPromise = new Promise((resolveS) => {
+            const sinaUrl = `https://fund.eastmoney.com/pingzhongdata/${c}.js?v=${Date.now()}`;
+            const sScript = document.createElement('script');
+            let sinaResolved = false;
+            sScript.onload = () => {
+              if (sinaResolved) return;
+              sinaResolved = true;
+              try {
+                if (typeof window.fS_code !== 'undefined' || window.Data_netWorthTrend) {
+                  const trends = window.Data_netWorthTrend;
+                  if (Array.isArray(trends) && trends.length >= 2) {
+                    const lastTwo = trends.slice(-2);
+                    const prevNav = parseFloat(lastTwo[0][1]);
+                    const currNav = parseFloat(lastTwo[1][1]);
+                    if (!isNaN(prevNav) && !isNaN(currNav) && prevNav > 0) {
+                      const historicalDailyChange = ((currNav - prevNav) / prevNav) * 100;
+                      resolveS({ valid: true, dailyChange: historicalDailyChange, sampleSize: trends.length });
+                      if (document.body.contains(sScript)) document.body.removeChild(sScript);
+                      return;
+                    }
+                  }
+
+                  if (window.Data_fundPerformance) {
+                    const perf = window.Data_fundPerformance;
+                    resolveS({ valid: true, hasPerformance: true, rawData: perf });
+                    if (document.body.contains(sScript)) document.body.removeChild(sScript);
+                    return;
+                  }
+                }
+                resolveS({ valid: false });
+              } catch (e) {
+                resolveS({ valid: false });
+              }
+              if (document.body.contains(sScript)) document.body.removeChild(sScript);
+            };
+            sScript.onerror = () => {
+              if (!sinaResolved) { sinaResolved = true; resolveS({ valid: false }); }
+              if (document.body.contains(sScript)) document.body.removeChild(sScript);
+            };
+            sScript.src = sinaUrl;
+            document.body.appendChild(sScript);
+
+            setTimeout(() => {
+              if (!sinaResolved) { sinaResolved = true; resolveS({ valid: false, timeout: true }); }
+            }, 5000);
+          });
+
+          try {
+            const sinaResult = await sinaValidationPromise;
+            if (sinaResult.valid && typeof gzData.estGszzl === 'number' && gzData.holdingEstimated) {
+              if (typeof sinaResult.dailyChange === 'number') {
+                const deviation = Math.abs(gzData.estGszzl - sinaResult.dailyChange);
+                if (deviation > 3 && holdingCoverage < 0.4) {
+                  const correctionWeight = Math.min(0.4, (deviation - 3) / 10);
+                  gzData.estGszzl = gzData.estGszzl * (1 - correctionWeight) + sinaResult.dailyChange * correctionWeight;
+                  if (typeof gzData.dwjz === 'number' && gzData.dwjz > 0) {
+                    gzData.estGsz = Number(gzData.dwjz) * (1 + gzData.estGszzl / 100);
+                  }
+                  gzData.sinaCorrected = true;
+                  gzData.correctionDeviation = deviation.toFixed(2);
+                } else if (deviation < 1.5 && holdingCoverage >= 0.5) {
+                  gzData.enhancedConfidence = 'high';
+                  gzData.sinaValidated = true;
+                }
+                gzData.sinaReference = sinaResult.dailyChange;
+              }
+            }
+          } catch (e) {}
+
           resolve(gzData);
         });
       };
@@ -4977,12 +5188,17 @@ export default function HomePage() {
                                 </div>
 
                                 {f.estPricedCoverage > 0.05 && (
-                                  <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: -8, marginBottom: 10, textAlign: 'right', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6 }}>
+                                  <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: -8, marginBottom: 10, textAlign: 'right', display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6, flexWrap: 'wrap' }}>
                                     <span style={{ opacity: 0.7 }}>
                                       持仓估算 {Math.round(f.estPricedCoverage * 100)}%
                                       {f.enhancedConfidence === 'high' && ' ⚡'}
                                       {f.enhancedConfidence === 'medium' && ' ○'}
+                                      {f.enhancedConfidence === 'low' && ' △'}
                                     </span>
+                                    {f.sinaCorrected && <span style={{ color: 'var(--accent-amber)' }}>已修正</span>}
+                                    {f.sinaValidated && <span style={{ color: 'var(--accent-emerald)' }}>已验证</span>}
+                                    {f.relatedIndex && <span>基准:{f.relatedIndex}</span>}
+                                    {f.fundType === 'bond' && <span style={{ color: 'var(--accent-purple)' }}>债基</span>}
                                   </div>
                                 )}
                                 <div
