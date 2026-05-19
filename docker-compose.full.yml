@@ -1,0 +1,36 @@
+services:
+  fund-app:
+    image: crpi-i9hka019bndmsv9l.cn-guangzhou.personal.cr.aliyuncs.com/mktyl/real-time-fund:latest
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - NODE_ENV=production
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    container_name: real-time-fund
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ./nginx/html:/usr/share/nginx/html:ro
+    depends_on:
+      fund-app:
+        condition: service_healthy
+    restart: unless-stopped
+    container_name: fund-nginx
