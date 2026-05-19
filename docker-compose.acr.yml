@@ -1,0 +1,15 @@
+services:
+  fund-app:
+    image: crpi-i9hka019bndmsv9l.cn-guangzhou.personal.cr.aliyuncs.com/mktyl/real-time-fund:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    container_name: real-time-fund
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
